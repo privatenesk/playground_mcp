@@ -17,11 +17,13 @@
     "build": "tsc",
     "dev": "tsx src/index.ts",
     "dev:http": "tsx src/http.ts",
+    "dev:worker": "wrangler dev",
+    "deploy": "wrangler deploy",
     "start": "node dist/index.js",
     "start:http": "node dist/http.js",
     "test": "vitest run",
     "test:watch": "vitest",
-    "typecheck": "tsc --noEmit",
+    "typecheck": "tsc --noEmit && tsc -p tsconfig.worker.json",
     "inspect": "npx @modelcontextprotocol/inspector tsx src/index.ts"
   },
   "keywords": [
@@ -36,9 +38,11 @@
     "zod": "^4.4.3"
   },
   "devDependencies": {
+    "@cloudflare/workers-types": "^4.20260612.1",
     "@types/node": "^25.9.3",
     "tsx": "^4.22.4",
     "typescript": "^6.0.3",
-    "vitest": "^4.1.8"
+    "vitest": "^4.1.8",
+    "wrangler": "^4.100.0"
   }
 }

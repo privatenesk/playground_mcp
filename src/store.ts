@@ -1,26 +1,31 @@
 /**
  * BookmarkStore — the persistence layer.
  *
- * Deliberately boring: an in-memory Map backed by a JSON file. The patterns
- * are what matter for production:
+ * Runtime-agnostic by design: this file uses only Web-standard APIs (no
+ * `node:*` imports), so the same class runs under Node (stdio/HTTP
+ * entrypoints), Cloudflare Workers (worker.ts), and tests. Where the data
+ * actually lives is delegated to a tiny {@link StorageAdapter}:
  *
- *  - **Atomic writes**: write to a temp file, then rename(2). A crash mid-write
- *    never leaves a half-written data file behind.
- *  - **Validated reads**: the file is parsed through a Zod schema on load, so
- *    corrupt or foreign data fails loudly at startup instead of mysteriously
- *    at request time.
+ *  - `FileStorage` (storage/file.ts)    → JSON file with atomic writes (Node)
+ *  - `DurableObjectStorage` (worker.ts) → Cloudflare DO storage (production)
+ *  - `MemoryStorage` (storage/memory.ts)→ throwaway storage for tests
+ *
+ * Production patterns that live here regardless of adapter:
+ *  - **Validated reads**: persisted data is parsed through a Zod schema on
+ *    load, so corrupt or foreign data fails loudly at startup instead of
+ *    mysteriously at request time.
  *  - **Serialized writes**: mutations queue behind a single promise chain, so
- *    concurrent tool calls can't interleave file writes.
- *
- * Swapping this for SQLite/Postgres later only touches this file — the MCP
- * layer (server.ts) depends on the class, not the storage mechanism.
+ *    concurrent tool calls can't interleave writes.
  */
-import { randomBytes } from "node:crypto";
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
-import path from "node:path";
+import { StoreFileSchema, type Bookmark, type StoreFile } from "./schemas.js";
 
-import { logger } from "./logger.js";
-import { StoreFileSchema, type Bookmark } from "./schemas.js";
+/** Minimal persistence port — implement this to add a new backend. */
+export interface StorageAdapter {
+  /** Return the persisted document, or null if nothing was saved yet. */
+  read(): Promise<unknown | null>;
+  /** Durably persist the document. */
+  write(data: StoreFile): Promise<void>;
+}
 
 export class BookmarkNotFoundError extends Error {
   constructor(id: string) {
@@ -43,28 +48,32 @@ export interface SearchFilters {
   limit?: number;
 }
 
+/** 8-char hex id via Web Crypto (available in Node 20+ and Workers). */
+function generateId(): string {
+  const bytes = crypto.getRandomValues(new Uint8Array(4));
+  return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+}
+
 export class BookmarkStore {
   private bookmarks = new Map<string, Bookmark>();
   private writeQueue: Promise<void> = Promise.resolve();
 
-  private constructor(private readonly filePath: string) {}
+  private constructor(private readonly storage: StorageAdapter) {}
 
-  /** Load (or initialize) the store from `filePath`. */
-  static async open(filePath: string): Promise<BookmarkStore> {
-    const store = new BookmarkStore(filePath);
-    try {
-      const raw = await readFile(filePath, "utf8");
-      const parsed = StoreFileSchema.parse(JSON.parse(raw));
+  /** Load (or initialize) the store from the given storage adapter. */
+  static async open(storage: StorageAdapter): Promise<BookmarkStore> {
+    const store = new BookmarkStore(storage);
+    const raw = await storage.read();
+    if (raw !== null) {
+      let parsed: StoreFile;
+      try {
+        parsed = StoreFileSchema.parse(raw);
+      } catch (error) {
+        // Corrupt data is a hard error — refuse to start and silently lose data.
+        throw new Error(`Failed to load bookmark store: ${String(error)}`);
+      }
       for (const bookmark of parsed.bookmarks) {
         store.bookmarks.set(bookmark.id, bookmark);
-      }
-      logger.info("store loaded", { filePath, count: store.bookmarks.size });
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-        logger.info("no data file yet, starting empty", { filePath });
-      } else {
-        // Corrupt data is a hard error — refuse to start and silently lose data.
-        throw new Error(`Failed to load bookmark store at ${filePath}: ${String(error)}`);
       }
     }
     return store;
@@ -77,7 +86,7 @@ export class BookmarkStore {
       }
     }
     const bookmark: Bookmark = {
-      id: randomBytes(4).toString("hex"),
+      id: generateId(),
       url: input.url,
       title: input.title ?? new URL(input.url).hostname,
       tags: [...new Set(input.tags.map((t) => t.toLowerCase()))],
@@ -150,19 +159,9 @@ export class BookmarkStore {
 
   /** Serialize writes: each persist waits for the previous one. */
   private persist(): Promise<void> {
-    this.writeQueue = this.writeQueue.then(() => this.writeToDisk());
-    return this.writeQueue;
-  }
-
-  private async writeToDisk(): Promise<void> {
-    const payload = JSON.stringify(
-      { version: 1 as const, bookmarks: this.all() },
-      null,
-      2,
+    this.writeQueue = this.writeQueue.then(() =>
+      this.storage.write({ version: 1, bookmarks: this.all() }),
     );
-    await mkdir(path.dirname(this.filePath), { recursive: true });
-    const tmpPath = `${this.filePath}.${process.pid}.tmp`;
-    await writeFile(tmpPath, payload, "utf8");
-    await rename(tmpPath, this.filePath); // atomic on POSIX filesystems
+    return this.writeQueue;
   }
 }

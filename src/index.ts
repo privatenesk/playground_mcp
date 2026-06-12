@@ -11,10 +11,12 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { config } from "./config.js";
 import { logger } from "./logger.js";
 import { SERVER_INFO, createServer } from "./server.js";
+import { FileStorage } from "./storage/file.js";
 import { BookmarkStore } from "./store.js";
 
 async function main(): Promise<void> {
-  const store = await BookmarkStore.open(config.dataFile);
+  const store = await BookmarkStore.open(new FileStorage(config.dataFile));
+  logger.info("store loaded", { dataFile: config.dataFile, count: store.size });
   const server = createServer(store);
   const transport = new StdioServerTransport();
 

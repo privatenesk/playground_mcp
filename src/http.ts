@@ -23,6 +23,7 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import { config } from "./config.js";
 import { logger } from "./logger.js";
 import { createServer } from "./server.js";
+import { FileStorage } from "./storage/file.js";
 import { BookmarkStore } from "./store.js";
 
 const MCP_PATH = "/mcp";
@@ -40,7 +41,7 @@ function isOriginAllowed(req: IncomingMessage): boolean {
 }
 
 async function main(): Promise<void> {
-  const store = await BookmarkStore.open(config.dataFile);
+  const store = await BookmarkStore.open(new FileStorage(config.dataFile));
   const transports = new Map<string, StreamableHTTPServerTransport>();
 
   const httpServer = createHttpServer(async (req: IncomingMessage, res: ServerResponse) => {

@@ -4,25 +4,20 @@
  * capability negotiation, schema validation, serialization — without spawning
  * a process. This is the standard way to test an MCP server.
  */
-import { mkdtemp, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import path from "node:path";
-
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { createServer } from "./server.js";
+import { MemoryStorage } from "./storage/memory.js";
 import { BookmarkStore } from "./store.js";
 
 describe("bookmark-mcp end-to-end", () => {
-  let dir: string;
   let client: Client;
   let cleanup: () => Promise<void>;
 
   beforeEach(async () => {
-    dir = await mkdtemp(path.join(tmpdir(), "bookmark-mcp-"));
-    const store = await BookmarkStore.open(path.join(dir, "bookmarks.json"));
+    const store = await BookmarkStore.open(new MemoryStorage());
     const server = createServer(store);
 
     const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
@@ -32,7 +27,6 @@ describe("bookmark-mcp end-to-end", () => {
     cleanup = async () => {
       await client.close();
       await server.close();
-      await rm(dir, { recursive: true, force: true });
     };
   });
 

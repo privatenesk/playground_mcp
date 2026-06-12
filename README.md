@@ -4,23 +4,28 @@ A deliberately **simple business case** (a personal bookmark / reading-list mana
 
 - **TypeScript** + the official [`@modelcontextprotocol/sdk`](https://github.com/modelcontextprotocol/typescript-sdk) (high-level `McpServer` API)
 - All three MCP primitives: **tools**, **resources** (static + templates), **prompts**
-- Both standard transports: **stdio** (local) and **Streamable HTTP** (remote, session-managed)
+- **Local dev & testing** on stdio / Node HTTP — **production on Cloudflare Workers** (Durable Object storage, deployed with one command)
 - **Zod** schemas as the single source of truth for validation, TypeScript types, and the JSON Schema shown to clients
 - Structured tool output (`outputSchema` + `structuredContent`) and tool **annotations** (`readOnlyHint`, `destructiveHint`, …)
-- Production patterns: stderr-only logging, atomic file writes, in-band error handling, origin validation, graceful shutdown, health endpoint
+- Production patterns: pluggable storage adapters, stderr-only logging, atomic file writes, in-band error handling, origin validation, graceful shutdown, health endpoint
 - **End-to-end tests** with a real MCP client over the SDK's in-memory transport
 
 ```
 src/
-├── index.ts        # entrypoint: stdio transport (local use)
-├── http.ts         # entrypoint: Streamable HTTP transport (remote use)
-├── server.ts       # MCP layer: registers tools, resources, prompts
-├── store.ts        # domain layer: JSON-file-backed bookmark store
-├── schemas.ts      # Zod schemas: validation + types + JSON Schema, all from one place
-├── config.ts       # env-var configuration
-├── logger.ts       # structured stderr logger
-├── server.test.ts  # end-to-end protocol tests (client ↔ server, in-memory)
-└── store.test.ts   # domain unit tests
+├── index.ts          # entrypoint: stdio transport (local use with Claude Code/Desktop)
+├── http.ts           # entrypoint: Node Streamable HTTP (local/self-hosted, session-managed)
+├── worker.ts         # entrypoint: Cloudflare Worker + Durable Object  ← PRODUCTION
+├── server.ts         # MCP layer: registers tools, resources, prompts (transport-agnostic)
+├── store.ts          # domain layer: BookmarkStore (runtime-agnostic, no node:* imports)
+├── storage/
+│   ├── file.ts       # StorageAdapter: JSON file with atomic writes (Node only)
+│   └── memory.ts     # StorageAdapter: in-memory (tests)
+├── schemas.ts        # Zod schemas: validation + types + JSON Schema, all from one place
+├── config.ts         # env-var configuration (Node entrypoints)
+├── logger.ts         # structured logger (stderr on Node, log stream on Workers)
+├── server.test.ts    # end-to-end protocol tests (client ↔ server, in-memory)
+└── store.test.ts     # domain unit tests
+wrangler.jsonc        # Cloudflare deployment config (DO binding + migration)
 ```
 
 ---
@@ -33,10 +38,12 @@ The use case fits in one sentence — *"save URLs, find them again, mark them re
 
 ```bash
 npm install
-npm test            # 14 end-to-end + unit tests
+npm test            # 15 end-to-end + unit tests
 npm run dev         # run on stdio (for MCP clients)
-npm run dev:http    # run on http://127.0.0.1:3000/mcp
+npm run dev:http    # Node server on http://127.0.0.1:3000/mcp
+npm run dev:worker  # the PRODUCTION worker, locally in workerd (http://localhost:8787/mcp)
 npm run inspect     # open the MCP Inspector UI against this server
+npm run deploy      # ship to Cloudflare Workers (needs `npx wrangler login` once)
 ```
 
 ### Connect it to Claude Code
@@ -74,7 +81,10 @@ Then ask things like *"bookmark https://example.com/article with tag testing"*, 
 
 ## Architecture
 
-The key design decision: **the MCP layer is transport-agnostic**. `createServer()` builds the same server whether it is served over stdio, HTTP, or an in-memory pipe in tests. The domain layer (`BookmarkStore`) knows nothing about MCP at all — swapping JSON-file persistence for SQLite touches one file.
+Two design decisions make the "test locally, run on Cloudflare" split cheap:
+
+1. **The MCP layer is transport-agnostic.** `createServer()` builds the same server whether it is served over stdio, Node HTTP, the Workers transport, or an in-memory pipe in tests.
+2. **The domain layer is runtime-agnostic.** `store.ts` uses only Web-standard APIs (no `node:*` imports) and persists through a 2-method `StorageAdapter` port. The file adapter is for laptops; the Durable Object adapter is production; the memory adapter is for tests.
 
 ```mermaid
 flowchart LR
@@ -84,10 +94,11 @@ flowchart LR
         T["Vitest test client"]
     end
 
-    subgraph Transports
-        STDIO["index.ts<br/>stdio (JSON-RPC over stdin/stdout)"]
-        HTTP["http.ts<br/>Streamable HTTP + sessions"]
-        MEM["InMemoryTransport<br/>(tests only)"]
+    subgraph Entrypoints
+        STDIO["index.ts<br/>stdio (local dev)"]
+        HTTP["http.ts<br/>Node Streamable HTTP"]
+        CF["worker.ts<br/>Cloudflare Worker + DO (production)"]
+        MEM["InMemoryTransport<br/>(tests)"]
     end
 
     subgraph Server["server.ts — createServer()"]
@@ -96,22 +107,28 @@ flowchart LR
         PROMPTS["Prompts<br/>reading_digest"]
     end
 
-    subgraph Domain
-        STORE["store.ts — BookmarkStore"]
-        FILE[("bookmarks.json<br/>atomic writes")]
+    subgraph Domain["store.ts — BookmarkStore (runtime-agnostic)"]
+        STORE["StorageAdapter port"]
     end
+
+    FILE[("storage/file.ts<br/>bookmarks.json, atomic writes")]
+    DO[("Durable Object storage<br/>strongly consistent")]
+    RAM[("storage/memory.ts")]
 
     CD --> STDIO
     IN --> STDIO
-    CD -.remote.-> HTTP
+    CD -.https://….workers.dev/mcp.-> CF
     T --> MEM
     STDIO --> Server
     HTTP --> Server
+    CF --> Server
     MEM --> Server
-    TOOLS --> STORE
-    RES --> STORE
-    PROMPTS --> STORE
+    TOOLS --> Domain
+    RES --> Domain
+    PROMPTS --> Domain
     STORE --> FILE
+    STORE --> DO
+    STORE --> RAM
 ```
 
 ### The three MCP primitives — who controls what
@@ -188,9 +205,9 @@ Two error channels, used deliberately:
 - **In-band tool errors** (`isError: true`) for *expected* business failures — duplicates, not-found, invalid input. The LLM sees the message and can recover (e.g. search for the existing bookmark instead).
 - **Protocol errors** (JSON-RPC errors / thrown exceptions) only for *unexpected* bugs.
 
-### 3. Streamable HTTP session lifecycle
+### 3. Streamable HTTP session lifecycle (Node self-hosted variant)
 
-The stdio transport is one process per client — no session management needed. Remote servers use Streamable HTTP, where sessions are explicit:
+The stdio transport is one process per client — no session management needed. The Node remote server uses Streamable HTTP with explicit sessions:
 
 ```mermaid
 sequenceDiagram
@@ -218,7 +235,9 @@ sequenceDiagram
 
 All sessions share one `BookmarkStore`, so the data is consistent across clients; each session gets its own `McpServer` instance, so protocol state never leaks between clients.
 
-### 4. Persistence: why writes can't corrupt the data file
+### 4. Persistence: why writes can't corrupt the data
+
+Locally (FileStorage adapter):
 
 ```mermaid
 flowchart TD
@@ -229,6 +248,58 @@ flowchart TD
     D --> E["rename() over bookmarks.json — atomic on POSIX"]
     E --> F["crash at any point ⇒ old file intact"]
 ```
+
+In production the Durable Object gives the same guarantees for free: its storage API is transactional, and the DO is single-threaded so writes are serialized by the platform itself.
+
+---
+
+## Production: Cloudflare Workers
+
+[worker.ts](src/worker.ts) is the production entrypoint. The stateless Worker routes every request to **one named Durable Object instance**, which owns the data and runs the MCP server:
+
+```mermaid
+sequenceDiagram
+    participant C as MCP client (Claude)
+    participant W as Worker (edge, stateless)
+    participant D as Durable Object "default"
+    participant S as DO storage (SQLite-backed)
+
+    C->>W: POST https://bookmark-mcp.you.workers.dev/mcp
+    W->>D: idFromName("default") → stub.fetch(request)
+    Note over D: first request after cold start?
+    D->>S: read + Zod-validate persisted store
+    D->>D: fresh McpServer + WebStandard transport<br/>(stateless: no Mcp-Session-Id)
+    D->>S: transactional write on mutation
+    D-->>C: JSON-RPC response (plain JSON)
+```
+
+Why this shape:
+
+- **Stateless MCP** (`sessionIdGenerator: undefined`, `enableJsonResponse: true`): serverless requests may hit any isolate, so there are no sticky sessions to manage — each POST is self-contained. This is the recommended pattern for serverless MCP hosting.
+- **One DO = the consistency boundary.** DO storage is strongly consistent and the instance is single-threaded, so concurrent clients can't corrupt data — the platform replaces both the atomic file writes and the write queue we need locally.
+- **`McpAgent` alternative:** Cloudflare's `agents` framework is the batteries-included route (per-session DOs, hibernation, OAuth templates). It needs external shared storage (KV/D1) because each *session* gets its own DO; the single shared DO here keeps the showcase self-contained and dependency-light. Reach for `McpAgent` when you need server→client notifications or the OAuth flow.
+- **Multi-tenancy is one line away:** derive the DO name from the authenticated user (`idFromName(userId)`) and every user gets an isolated store.
+
+### Deploy
+
+```bash
+npx wrangler login        # once
+npm run deploy            # builds + ships; prints https://bookmark-mcp.<you>.workers.dev
+```
+
+Connect Claude to the deployed server:
+
+```bash
+claude mcp add --transport http bookmarks https://bookmark-mcp.<you>.workers.dev/mcp
+```
+
+Local test of the *exact* production code path (runs in `workerd`, with a local DO):
+
+```bash
+npm run dev:worker        # http://localhost:8787/mcp + /healthz
+```
+
+Before sharing the URL publicly, add auth — simplest is Cloudflare Access in front of the route; the full-fidelity option is the MCP OAuth 2.1 flow (`workers-oauth-provider`). The free plan (100k requests/day, SQLite-backed DOs included) comfortably covers personal use.
 
 ---
 
@@ -241,22 +312,21 @@ flowchart TD
 | **Structured output** | [server.ts](src/server.ts) | Tools declare `outputSchema` and return `structuredContent` next to human-readable `content`. |
 | **Tool annotations** | [server.ts](src/server.ts) | `readOnlyHint` on search, `destructiveHint` on delete (clients can require confirmation), `idempotentHint` on mark_read. |
 | **Recoverable errors** | [server.ts](src/server.ts) | Business failures are `isError: true` results the model can read; only bugs throw. |
-| **Durable writes** | [store.ts](src/store.ts) | Temp-file + `rename()` atomic writes, serialized through a write queue; corrupt files fail loudly at startup. |
+| **Pluggable storage** | [store.ts](src/store.ts), [storage/](src/storage) | Runtime-agnostic domain layer + 2-method `StorageAdapter` port: file (local), Durable Object (production), memory (tests). |
+| **Durable writes** | [storage/file.ts](src/storage/file.ts), [worker.ts](src/worker.ts) | Locally: temp-file + `rename()` atomic writes behind a write queue. In production: transactional DO storage. Corrupt data fails loudly at startup. |
 | **Remote security** | [http.ts](src/http.ts) | Origin validation, `127.0.0.1` binding by default, per-session transports, `/healthz` for orchestrators. |
 | **Graceful shutdown** | both entrypoints | SIGINT/SIGTERM close sessions and the transport before exiting. |
 | **Testing** | [server.test.ts](src/server.test.ts) | A real `Client` over `InMemoryTransport.createLinkedPair()` exercises the full JSON-RPC stack without spawning processes. |
 | **Config via env** | [config.ts](src/config.ts) | Matches how MCP clients pass configuration (`env` block in the client's server config). |
 
-## Production checklist (what to add when you leave the laptop)
+## Production checklist (what's still missing before a public launch)
 
-This showcase stays intentionally small. Before exposing the HTTP transport publicly you would add:
+The Workers deployment already covers TLS, scaling, durable storage, and observability (`wrangler tail` / dashboard logs). What this showcase deliberately leaves out:
 
-1. **Authentication** — the MCP spec mandates OAuth 2.1 for remote servers; the SDK ships helpers (`@modelcontextprotocol/sdk/server/auth`). Behind a private gateway, a bearer-token middleware may be sufficient.
-2. **TLS** — terminate HTTPS at a reverse proxy; never ship tokens over plain HTTP.
-3. **Real storage** — replace the JSON file in `store.ts` with SQLite/Postgres; nothing else changes.
-4. **Rate limiting & request size caps** on the HTTP endpoint.
-5. **Observability** — the structured stderr logs are ready for any log shipper; add metrics on session count and tool latency.
-6. **Resumability** — pass an `eventStore` to `StreamableHTTPServerTransport` so clients can resume SSE streams after disconnects.
+1. **Authentication** — the MCP spec mandates OAuth 2.1 for remote servers. On Cloudflare: `workers-oauth-provider` (full spec flow) or Cloudflare Access with a service token (pragmatic personal setup). On Node: `@modelcontextprotocol/sdk/server/auth` helpers.
+2. **Multi-tenancy** — currently all clients share one bookmark collection; derive the DO name from the authenticated user to isolate stores.
+3. **Rate limiting & request size caps** — Cloudflare WAF rules or a rate-limit binding.
+4. **Server→client notifications** — the stateless Worker pattern has no SSE channel; if you need `listChanged` notifications or progress streams, move to session-managed transports (Node `http.ts` already does this; on Workers use `McpAgent`).
 
 ## Extending the server
 
@@ -270,6 +340,8 @@ Adding a capability is a three-step pattern — schema, domain, registration:
 
 ```bash
 npm run inspect                      # MCP Inspector: interactive UI for tools/resources/prompts
-LOG_LEVEL=debug npm run dev          # verbose stderr logs
+LOG_LEVEL=debug npm run dev          # verbose stderr logs (Node)
 npm test                             # full protocol round-trip without any client
+npm run dev:worker                   # production code path locally (workerd + local DO)
+npx wrangler tail                    # live logs from the deployed Worker
 ```
