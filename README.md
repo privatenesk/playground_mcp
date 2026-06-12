@@ -117,7 +117,7 @@ flowchart LR
 
     CD --> STDIO
     IN --> STDIO
-    CD -.https://….workers.dev/mcp.-> CF
+    CD -.->|"remote: workers.dev/mcp"| CF
     T --> MEM
     STDIO --> Server
     HTTP --> Server
